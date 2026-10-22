@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PDF Redact</title>
+<style>
+  body { margin: 0; font: 14px system-ui, sans-serif; background: #e5e5e5; }
+  header { position: sticky; top: 0; z-index: 10; background: #fff; border-bottom: 1px solid #ccc;
+           padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  header fieldset { border: 1px solid #ddd; border-radius: 4px; padding: 4px 8px; margin: 0;
+                    display: flex; gap: 6px; align-items: center; }
+  header legend { font-size: 11px; color: #666; padding: 0 2px; }
+  textarea { width: 180px; height: 34px; font: inherit; resize: vertical; }
+  input[type=text] { width: 110px; }
+  button { cursor: pointer; }
+  #apply { font-weight: bold; }
+  #status { flex-basis: 100%; color: #444; font-size: 13px; white-space: pre-wrap; }
+  #status.err { color: #b00; }
+  #pages { padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+  .page { position: relative; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.3);
+          cursor: crosshair; user-select: none; touch-action: none; }
+  .page img { width: 100%; height: 100%; display: block; pointer-events: none; }
+  .pno { position: absolute; left: -36px; top: 0; color: #777; font-size: 12px; }
+  .box { position: absolute; box-sizing: border-box; }
+  /* previews look like the result; hovering makes a region see-through to check what's under it */
+  .box.blackout { outline: 1px solid rgba(128,128,128,.6); cursor: pointer; }
+  .box.replace { outline: 1px dotted rgba(0,102,204,.5); color: #000; overflow: visible;
+                 white-space: nowrap; font-family: sans-serif; }
+  .box:hover { opacity: .35; }
+  .swatch { width: 18px; height: 18px; padding: 0; border: 1px solid #999; border-radius: 3px; }
+  .swatch.on { outline: 2px solid #06c; outline-offset: 1px; }
+  #color { width: 30px; height: 22px; padding: 0; border: 0; }
+  .box.drawing { background: rgba(255,0,0,.15); outline: 1px dashed red; }
+  .box .x { position: absolute; right: -1px; top: -1px; display: none; border: 0; padding: 0 3px;
+            background: #c00; color: #fff; font-size: 11px; line-height: 14px; }
+  .box:hover .x { display: block; }
+  #drop { cursor: pointer; margin: 80px auto; padding: 60px; max-width: 420px; text-align: center; color: #666;
+          border: 2px dashed #aaa; border-radius: 8px; background: #fafafa; }
+</style>
+</head>
+<body>
+<header>
+  <label><input type="file" id="file" accept="application/pdf,.pdf"></label>
+  <fieldset><legend>Draw mode (B / R)</legend>
+    <label><input type="radio" name="mode" value="blackout" checked> Blackout</label>
+    <label><input type="radio" name="mode" value="replace"> Replace text</label>
+  </fieldset>
+  <fieldset id="palette"><legend>Blackout colour (click a region to recolour it)</legend>
+    <button class="swatch on" style="background:#000000" data-c="#000000" title="black"></button>
+    <button class="swatch" style="background:#404040" data-c="#404040" title="dark grey"></button>
+    <button class="swatch" style="background:#9e9e9e" data-c="#9e9e9e" title="grey"></button>
+    <button class="swatch" style="background:#ffffff" data-c="#ffffff" title="white (erase)"></button>
+    <button class="swatch" style="background:#c62828" data-c="#c62828" title="red"></button>
+    <button class="swatch" style="background:#1f4e9c" data-c="#1f4e9c" title="blue"></button>
+    <input type="color" id="color" value="#000000" title="any colour">
+  </fieldset>
+  <fieldset><legend>Black out matches</legend>
+    <textarea id="terms" placeholder="one term per line"></textarea>
+    <label title="treat each line as a regular expression"><input type="checkbox" id="regex"> regex</label>
+    <button id="find">Find</button>
+  </fieldset>
+  <fieldset><legend>Find &amp; replace</legend>
+    <input type="text" id="old" placeholder="find"> &rarr; <input type="text" id="new" placeholder="replace with">
+    <button id="replace">Find</button>
+  </fieldset>
+  <label><input type="checkbox" id="case"> match case</label>
+  <label>Zoom <select id="zoom">
+    <option>0.75</option><option selected>1.25</option><option>1.5</option><option>2</option>
+  </select></label>
+  <label title="remove metadata, XMP, JavaScript, attachments and thumbnails"><input type="checkbox" id="scrub" checked> scrub metadata</label>
+  <button id="undo" title="Ctrl+Z: undo the last action (a whole Find counts as one)" disabled>Undo</button>
+  <button id="clear" title="back to the file as opened (can itself be undone)" disabled>Undo all</button>
+  <button id="apply">Apply &amp; download</button>
+  <div id="status">Open a PDF, then drag on a page to mark a region. Hover a region to see through it and click × to remove it; click a blackout to give it the current colour; double-click a replace region to edit its text.</div>
+</header>
+<div id="pages"><div id="drop">Click to choose a PDF file, or drop one here</div></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let doc = null;    // {id, name, pages: [[w, h], ...]}
+let ops = [];      // {page, rect: [x0, y0, x1, y1] in PDF points, kind, text}
+let saved = "[]";  // ops as last downloaded, to warn only about unsaved work
+let history = [];  // snapshots of ops before each action, for Undo
+
+function status(msg, err = false) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+function zoom() { return parseFloat($("zoom").value); }
+function mode() { return document.querySelector("input[name=mode]:checked").value; }
+function color() { return $("color").value; }
+
+async function api(path, body) {
+  const res = await fetch(path, { method: "POST", body: body instanceof Blob ? body : JSON.stringify(body) });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+  return res;
+}
+
+async function openFile(file) {
+  if (!file) return;
+  status(`Opening ${file.name}...`);
+  try {
+    const info = await (await api("/api/open", file)).json();
+    doc = { id: info.id, name: file.name, pages: info.pages };
+    ops = [];
+    saved = "[]";
+    history = [];
+    render();
+    status(`${file.name}: ${doc.pages.length} page(s).`);
+  } catch (e) { status(e.message, true); }
+}
+
+function render() {
+  const z = zoom(), dpr = window.devicePixelRatio || 1, root = $("pages");
+  root.innerHTML = "";
+  doc.pages.forEach(([w, h], n) => {
+    const page = document.createElement("div");
+    page.className = "page";
+    page.dataset.n = n;
+    page.style.width = w * z + "px";
+    page.style.height = h * z + "px";
+    page.innerHTML = `<span class="pno">${n + 1}</span>`;
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.src = `/api/page?id=${doc.id}&n=${n}&scale=${z * dpr}`;
+    // replace previews take their background colour from the rendered page
+    img.addEventListener("load", () => ops.some((o) => o.kind === "replace" && o.page === n) && drawBoxes());
+    page.appendChild(img);
+    page.addEventListener("pointerdown", startDraw);
+    root.appendChild(page);
+  });
+  drawBoxes();
+}
+
+// Median colour of a thin ring just outside a region on the rendered page -
+// what the saved PDF shows there once the old text is gone.
+const backgrounds = new WeakMap();  // op -> {src, colour}, so each is sampled once per rendering
+function background(op) {
+  const img = document.querySelectorAll(".page img")[op.page];
+  if (!img || !img.complete || !img.naturalWidth) return "transparent";
+  const cached = backgrounds.get(op);
+  if (cached && cached.src === img.src && cached.rect === op.rect) return cached.colour;
+  const s = img.naturalWidth / doc.pages[op.page][0], [x0, y0, x1, y1] = op.rect;
+  const X0 = Math.max(0, Math.floor((x0 - 3) * s)), Y0 = Math.max(0, Math.floor((y0 - 3) * s));
+  const X1 = Math.min(img.naturalWidth, Math.ceil((x1 + 3) * s));
+  const Y1 = Math.min(img.naturalHeight, Math.ceil((y1 + 3) * s));
+  const w = X1 - X0, h = Y1 - Y0, ring = 3;
+  if (w <= 2 * ring || h <= 2 * ring) return "transparent";
+  const c = document.createElement("canvas");  // just the region and its ring
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(img, X0, Y0, w, h, 0, 0, w, h);
+  const px = ctx.getImageData(0, 0, w, h).data, ch = [[], [], []];
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++)
+      if (x < ring || y < ring || x >= w - ring || y >= h - ring)
+        for (let i = 0; i < 3; i++) ch[i].push(px[(y * w + x) * 4 + i]);
+  const colour = `rgb(${ch.map((v) => v.sort((a, b) => a - b)[v.length >> 1]).join(",")})`;
+  backgrounds.set(op, { src: img.src, rect: op.rect, colour });
+  return colour;
+}
+
+function drawBoxes() {
+  document.querySelectorAll(".box").forEach((b) => b.remove());
+  const z = zoom(), pages = document.querySelectorAll(".page");
+  ops.forEach((op) => {
+    const b = document.createElement("div");
+    b.className = "box " + op.kind;
+    const [x0, y0, x1, y1] = op.rect;
+    Object.assign(b.style, { left: x0 * z + "px", top: y0 * z + "px", width: (x1 - x0) * z + "px", height: (y1 - y0) * z + "px" });
+    if (op.kind === "blackout") {
+      b.style.background = op.color;
+      b.title = "click: use the current colour";
+      b.addEventListener("click", () => { remember(); op.color = color(); drawBoxes(); });
+    } else {
+      b.textContent = op.text || "(cleared)";
+      b.style.background = background(op);  // hides the old text in the preview, matching the page
+      b.title = "double-click to edit";
+      // roughly the size the text will have (a found word's box is ~1.02x its font size)
+      Object.assign(b.style, { fontSize: (y1 - y0) * z * 0.9 + "px", lineHeight: (y1 - y0) * z + "px" });
+      b.addEventListener("dblclick", () => {
+        const t = prompt("Replacement text (empty = just clear)", op.text);
+        if (t !== null && t !== op.text) { remember(); op.text = t; drawBoxes(); }
+      });
+    }
+    const x = document.createElement("button");
+    x.className = "x";
+    x.textContent = "×";
+    x.addEventListener("click", (e) => { e.stopPropagation(); remember(); ops.splice(ops.indexOf(op), 1); drawBoxes(); });
+    b.appendChild(x);
+    b.addEventListener("pointerdown", (e) => e.stopPropagation());
+    pages[op.page].appendChild(b);
+  });
+  $("undo").disabled = !history.length;
+  $("clear").disabled = !ops.length;
+  if (doc) status(`${doc.name}: ${ops.length} region(s) marked.`);
+}
+
+function startDraw(e) {
+  if (e.button !== 0) return;
+  const page = e.currentTarget, box = page.getBoundingClientRect(), z = zoom();
+  const clamp = (v, max) => Math.min(Math.max(v, 0), max);
+  const pt = (ev) => [clamp(ev.clientX - box.left, box.width), clamp(ev.clientY - box.top, box.height)];
+  const [sx, sy] = pt(e);
+  const tmp = document.createElement("div");
+  tmp.className = "box drawing";
+  page.appendChild(tmp);
+  page.setPointerCapture(e.pointerId);
+  let end = [sx, sy];
+  const move = (ev) => {
+    end = pt(ev);
+    Object.assign(tmp.style, { left: Math.min(sx, end[0]) + "px", top: Math.min(sy, end[1]) + "px",
+      width: Math.abs(end[0] - sx) + "px", height: Math.abs(end[1] - sy) + "px" });
+  };
+  const up = () => {
+    page.removeEventListener("pointermove", move);
+    page.removeEventListener("pointerup", up);
+    page.removeEventListener("pointercancel", up);
+    tmp.remove();
+    if (Math.abs(end[0] - sx) < 3 || Math.abs(end[1] - sy) < 3) return;
+    const rect = [Math.min(sx, end[0]) / z, Math.min(sy, end[1]) / z, Math.max(sx, end[0]) / z, Math.max(sy, end[1]) / z];
+    const op = { page: +page.dataset.n, rect, kind: mode(), text: "", color: color() };
+    if (op.kind === "replace") {
+      const t = prompt("Replacement text (empty = just clear)", "");
+      if (t === null) return;
+      op.text = t;
+    }
+    remember();
+    ops.push(op);
+    drawBoxes();
+  };
+  page.addEventListener("pointermove", move);
+  page.addEventListener("pointerup", up);
+  page.addEventListener("pointercancel", up);
+}
+
+async function findHits(lines, regex) {
+  const body = { id: doc.id, case: $("case").checked, terms: regex ? [] : lines, regexes: regex ? lines : [] };
+  return (await (await api("/api/find", body)).json()).hits;
+}
+
+function addHits(hits, kind, text = "") {
+  const seen = new Set(ops.map((o) => o.page + ":" + o.rect.join(",")));
+  const before = JSON.stringify(ops);  // the whole batch is one undo step
+  let added = 0;
+  hits.forEach((h) => h.rects.forEach((rect, i) => {
+    const key = h.page + ":" + rect.join(",");
+    if (seen.has(key)) return;
+    seen.add(key);
+    ops.push({ page: h.page, rect, kind, text: i === 0 ? text : "", color: color() });
+    added++;
+  }));
+  if (added) history.push(before);
+  drawBoxes();
+  return added;
+}
+
+$("find").addEventListener("click", async () => {
+  if (!doc) return status("Open a PDF first.", true);
+  const lines = $("terms").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (!lines.length) return status("Enter at least one term.", true);
+  try {
+    const hits = await findHits(lines, $("regex").checked);
+    const added = addHits(hits, "blackout");
+    status(`${hits.length} match(es), ${added} new region(s); ${ops.length} total.`);
+  } catch (e) { status(e.message, true); }
+});
+
+$("replace").addEventListener("click", async () => {
+  if (!doc) return status("Open a PDF first.", true);
+  const old = $("old").value.trim();
+  if (!old) return status("Enter the text to find.", true);
+  try {
+    const hits = await findHits([old], false);
+    const added = addHits(hits, "replace", $("new").value);
+    status(`${hits.length} match(es), ${added} new region(s); ${ops.length} total.`);
+  } catch (e) { status(e.message, true); }
+});
+
+$("apply").addEventListener("click", async () => {
+  if (!doc) return status("Open a PDF first.", true);
+  status("Applying...");
+  try {
+    const res = await api("/api/apply", { id: doc.id, ops, scrub: $("scrub").checked });
+    const leaks = JSON.parse(res.headers.get("X-Redact-Leaks") || "[]");
+    const notes = JSON.parse(res.headers.get("X-Redact-Notes") || "[]");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(await res.blob());
+    a.download = doc.name.replace(/\.pdf$/i, "") + "-redacted.pdf";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    saved = JSON.stringify(ops);
+    const extra = notes.length ? "\n" + notes.join("\n") : "";
+    if (leaks.length) status("Saved, but check these:\n" + leaks.join("\n") + extra, true);
+    else status(`Saved ${a.download} with ${ops.length} region(s) applied. The original file is unchanged.` + extra);
+  } catch (e) { status(e.message, true); }
+});
+
+$("file").addEventListener("change", (e) => openFile(e.target.files[0]));
+document.addEventListener("click", (e) => { if (e.target.id === "drop") $("file").click(); });
+$("zoom").addEventListener("change", () => doc && render());
+function markSwatch() {
+  document.querySelectorAll(".swatch").forEach((s) => s.classList.toggle("on", s.dataset.c === color()));
+}
+document.querySelectorAll(".swatch").forEach((s) =>
+  s.addEventListener("click", () => { $("color").value = s.dataset.c; markSwatch(); }));
+$("color").addEventListener("input", markSwatch);
+function remember() { history.push(JSON.stringify(ops)); }
+function undo() {
+  if (history.length) { ops = JSON.parse(history.pop()); drawBoxes(); }
+}
+function undoAll() {  // back to the file as opened; Undo brings everything back
+  if (ops.length && confirm("Undo all changes and go back to the file as opened?")) { remember(); ops = []; drawBoxes(); }
+}
+$("undo").addEventListener("click", undo);
+$("clear").addEventListener("click", undoAll);
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => { e.preventDefault(); openFile(e.dataTransfer.files[0]); });
+document.addEventListener("keydown", (e) => {
+  if (e.target.matches("input, textarea, select")) return;
+  if ((e.ctrlKey || e.metaKey) && e.key === "z") { e.preventDefault(); undo(); }
+  else if (e.key === "b" || e.key === "r") {
+    document.querySelector(`input[name=mode][value=${e.key === "b" ? "blackout" : "replace"}]`).checked = true;
+  }
+});
+window.addEventListener("beforeunload", (e) => { if (JSON.stringify(ops) !== saved) e.preventDefault(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+[project]
+name = "pdf-redaction-tool"
+version = "0.1.0"
+description = "Small PDF redaction tool: black out or replace text, CLI and local browser editor"
+requires-python = ">=3.12"
+dependencies = [
+    # 1.28.x: PyMuPDF 2.0 pulls in onnxruntime, numpy, networkx etc. for AI
+    # layout features this tool does not use; 1.28 has no dependencies.
+    "pymupdf>=1.28,<2",
+]
+
+[project.scripts]
+pdf-redact = "pdf_redact.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "pdf_redact"
