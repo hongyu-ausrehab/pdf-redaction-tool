@@ -14,8 +14,10 @@ in the region) using thin bands through their box centres; pass 2 paints the
 region black and blanks image pixels without touching text.
 """
 
+import contextlib
 import math
 import re
+import secrets
 from dataclasses import dataclass, field
 
 import pymupdf
@@ -239,7 +241,7 @@ def _disturbed(kept, after, tol=0.15):
                                        for p in near(c))]
 
 
-def find(doc, pat, pages=None):
+def _find(doc, pat, pages=None):
     """All matches of a compiled pattern, as Hits with one displayed rect per line."""
     hits = []
     for pno in pages if pages is not None else range(doc.page_count):
@@ -592,7 +594,7 @@ def _purge_overlapping(page, rects):
     return [f"page {page.number + 1}: removed {n} (overlaps a redacted region)" for n in notes]
 
 
-def apply(doc, ops):
+def _apply(doc, ops, shown=None):
     """Apply ops to doc in place and return notes on what else was removed.
     Where a blackout overlaps a replacement, the blackout wins and the
     replacement text is not written."""
@@ -620,6 +622,11 @@ def apply(doc, ops):
             sel = chars_in(chars, r)
             selected.update((c.pos, c) for c in sel)
             if op.kind == "replace" and op.text and not any(r.intersects(b) for b in blackouts):
+                visible = [c for c in sel if not c.c.isspace()]
+                if shown is not None and pno in shown and visible and not any(_key(c) in shown[pno] for c in visible):
+                    # text only on a hidden layer: writing it would make it appear
+                    notes.append(f"page {pno + 1}: replaced text was on a hidden layer - removed, not rewritten")
+                    continue
                 writes.append((r, op.text, sel))
         kept = [c for c in chars if c and c.pos not in selected and not c.c.isspace()]
         removals = _removal_rects(chars, list(selected.values()))
@@ -661,14 +668,226 @@ def apply(doc, ops):
                 notes.append(note)
 
         # Pass 2: paint blackouts and blank whatever images / vector art they cover.
+        # Where a blackout covers OCR text over an image, the area is padded a
+        # little: OCR boxes don't align exactly with the words in the picture (a
+        # trap file left part of the last digit). A box drawn over a picture
+        # with no text in it is taken exactly as drawn.
+        images = [r for im in page.get_images(full=True) for r in page.get_image_rects(im[0])]
         for op, r in regions:
             if op.kind == "blackout":
+                if any(r.intersects(im) for im in images) and chars_in(chars, r):
+                    pad = min(0.2 * min(r.height, r.width), 4)
+                    r = r + (-pad, -pad, pad, pad)
                 page.add_redact_annot(r, fill=op.color, cross_out=False)
         if blackouts:
             page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_PIXELS,
                                   graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
                                   text=pymupdf.PDF_REDACT_TEXT_NONE)
     return notes
+
+
+# --- copies of the text outside the visible page ------------------------------
+# A forensic scan (scripts/forensic_check.py, DESIGN.md section 8) found text
+# surviving a redaction in places the visible page doesn't show: hidden
+# layers, marked-content /ActualText, structure-tree /Alt, /PieceInfo, and
+# comments / links / bookmarks that mention a searched term.
+
+
+def _key(c):
+    """Identity of an extracted char across two extractions of the same page."""
+    return c.c, round(c.bbox.x0, 1), round(c.bbox.y0, 1)
+
+
+@contextlib.contextmanager
+def all_layers_visible(doc):
+    """Switch every optional-content layer on while text is found and removed
+    (extraction skips hidden layers, so their text would survive), then
+    restore the document's own settings. (set_layer() was tried first: it
+    left the layers' state unchanged, so their text stayed invisible to
+    extraction; the UI-config call is what MuPDF's renderer obeys.)"""
+    configs = [c for c in doc.layer_ui_configs() if c["type"] in ("checkbox", "radiobox")]
+    hidden = [c["number"] for c in configs if not c["on"]]
+    for number in hidden:
+        doc.set_layer_ui_config(number, 0)  # 0: on
+    try:
+        yield
+    finally:
+        for number in hidden:
+            doc.set_layer_ui_config(number, 2)  # 2: off again
+
+
+def find(doc, pat, pages=None):
+    """All matches of a compiled pattern, including text on hidden layers, as
+    Hits with one displayed rect per line."""
+    with all_layers_visible(doc):
+        return _find(doc, pat, pages)
+
+
+def apply(doc, ops):
+    """Apply ops to doc in place and return notes on what else was removed.
+    Where a blackout overlaps a replacement, the blackout wins and the
+    replacement text is not written. On every page with a region, copies of
+    text kept outside the visible content are removed too."""
+    shown = None  # page -> chars visible with the document's own layer settings
+    if any(not c["on"] for c in doc.layer_ui_configs()):
+        shown = {p: {_key(c) for c in page_chars(doc[p])[1] if c}
+                 for p in {op.page for op in ops if op.kind == "replace" and 0 <= op.page < doc.page_count}}
+    with all_layers_visible(doc):
+        notes = _apply(doc, ops, shown)
+    pages = sorted({op.page for op in ops})
+    counts = [_strip_page_copies(doc, doc[pno]) for pno in pages]
+    counts.append(_strip_struct_text(doc, {doc[pno].xref for pno in pages}) if pages else 0)
+    if sum(counts):
+        notes.append(f"removed {sum(counts)} hidden copies of text (accessibility tags such as ActualText/Alt, "
+                     "application data) from the redacted pages")
+    return notes
+
+
+_MC_TEXT = re.compile(rb"/(?:ActualText|Alt|E)(?=[\s(<])\s*")
+_INLINE_IMAGE = re.compile(rb"(?<![^\s])BI(?![^\s])")
+
+
+def _strip_marked_text(src):
+    """Remove /ActualText, /Alt and /E entries (alternative text for marked
+    content) from a content stream. Returns (new stream, count)."""
+    out, i, n = bytearray(), 0, 0
+    while m := _MC_TEXT.search(src, i):
+        j = k = m.end()
+        if src[j : j + 1] == b"(":  # literal string: balanced parens, \-escapes
+            depth = 0
+            while k < len(src):
+                c = src[k]
+                if c == 0x5C:
+                    k += 2
+                    continue
+                depth += (c == 0x28) - (c == 0x29)
+                k += 1
+                if depth == 0:
+                    break
+        elif src[j : j + 1] == b"<" and src[j + 1 : j + 2] != b"<":  # hex string
+            k = src.find(b">", j) + 1 or len(src)
+        else:  # a name, not a string value: leave it
+            out += src[i:j]
+            i = j
+            continue
+        out += src[i : m.start()]
+        i, n = k, n + 1
+    return bytes(out + src[i:]), n
+
+
+def _strip_page_copies(doc, page):
+    """Alternative-text entries in the page's content and property lists, its
+    /PieceInfo (an editing application's private copy of the page) and its
+    /Thumb (a thumbnail picture of the page as it was - kept with scrub off
+    before, and invisible to a text scan)."""
+    n = 0
+    for xref in page.get_contents() + [x[0] for x in page.get_xobjects()]:
+        src = doc.xref_stream(xref) or b""
+        if _INLINE_IMAGE.search(src):
+            continue  # inline image data can't be scanned safely
+        new, k = _strip_marked_text(src)
+        if k:
+            doc.update_stream(xref, new)
+            n += k
+    for holder in [page.xref] + [x[0] for x in page.get_xobjects()]:
+        props = _object_text(doc, holder, "Resources/Properties")
+        for ref in re.findall(r"/[^\s/<>\[\]()]+\s+(\d+)\s+0\s+R", props):
+            for key in ("ActualText", "Alt", "E"):
+                if doc.xref_get_key(int(ref), key)[0] != "null":
+                    doc.xref_set_key(int(ref), key, "null")
+                    n += 1
+        if doc.xref_get_key(holder, "PieceInfo")[0] != "null":
+            doc.xref_set_key(holder, "PieceInfo", "null")
+            n += 1
+    if doc.xref_get_key(page.xref, "Thumb")[0] != "null":
+        doc.xref_set_key(page.xref, "Thumb", "null")
+        n += 1
+    return n
+
+
+def _strip_struct_text(doc, page_xrefs):
+    """Alternative text in structure elements (tagged PDF) for the given pages,
+    or for elements not tied to a page."""
+    n = 0
+    for x in range(1, doc.xref_length()):
+        try:
+            if doc.xref_get_key(x, "S")[0] != "name" or doc.xref_get_key(x, "P")[0] == "null":
+                continue  # not a structure element
+            kind, pg = doc.xref_get_key(x, "Pg")
+            if kind == "xref" and int(pg.split()[0]) not in page_xrefs:
+                continue
+            for key in ("ActualText", "Alt", "E"):
+                if doc.xref_get_key(x, key)[0] != "null":
+                    doc.xref_set_key(x, key, "null")
+                    n += 1
+        except Exception:
+            continue  # free or broken object
+    return n
+
+
+def scrub_matches(doc, pat, replacement=None):
+    """Remove a searched term where page regions can't reach it: comments,
+    form fields, links and attachments that mention it are deleted; bookmark
+    titles and metadata get it replaced (by `replacement`, or "[redacted]")."""
+    new = "[redacted]" if replacement is None else replacement
+    sub = lambda s: pat.sub(lambda m: new, s)  # noqa: E731 (lambda: no backslash processing)
+    notes = []
+    for page in doc:
+        found = []
+        for annot in list(page.annots()):
+            if annot.type[0] != pymupdf.PDF_ANNOT_REDACT and any(
+                    pat.search(annot.info.get(k) or "") for k in ("content", "title", "subject")):
+                found.append(f"{annot.type[1]} annotation")
+                page.delete_annot(annot)
+        for widget in list(page.widgets()):
+            if pat.search(str(widget.field_value or "")) or pat.search(widget.field_name or ""):
+                found.append(f"form field {widget.field_name!r}")
+                page.delete_widget(widget)
+        for link in page.get_links():
+            if pat.search(link.get("uri") or "") or pat.search(link.get("file") or ""):
+                found.append("link")
+                page.delete_link(link)
+        notes += [f"page {page.number + 1}: removed {f} mentioning a searched term" for f in found]
+    toc = doc.get_toc(simple=False)
+    if any(pat.search(item[1]) for item in toc):
+        for item in toc:
+            item[1] = sub(item[1])
+        doc.set_toc(toc)
+        notes.append("bookmark titles: searched terms replaced")
+    meta = doc.metadata or {}
+    if any(v and pat.search(v) for v in meta.values()):
+        doc.set_metadata({k: sub(v) if v else v for k, v in meta.items() if k not in ("format", "encryption")})
+        notes.append("document metadata: searched terms replaced")
+    if pat.search(doc.get_xml_metadata() or ""):
+        doc.del_xml_metadata()
+        notes.append("XMP metadata removed: it mentioned a searched term")
+    for name in [doc.embfile_info(i)["name"] for i in range(doc.embfile_count())]:
+        if pat.search(name) or pat.search(doc.embfile_get(name).decode("latin-1", errors="ignore")):
+            doc.embfile_del(name)
+            notes.append(f"attachment {name!r} removed: it mentioned a searched term")
+    js = 0  # JavaScript mentioning the term: emptied (with scrub off it would otherwise stay)
+    for x in range(1, doc.xref_length()):
+        for path in _JS_PATHS:
+            try:
+                kind, value = doc.xref_get_key(x, path)
+                if kind == "null":
+                    continue
+                if kind == "xref":
+                    value = (doc.xref_stream(int(value.split()[0])) or b"").decode("latin-1", errors="ignore")
+                if pat.search(value):
+                    doc.xref_set_key(x, path, "()")
+                    js += 1
+            except Exception:
+                continue  # free or broken object
+    if js:
+        notes.append(f"{js} JavaScript action(s) mentioning a searched term emptied")
+    return notes
+
+
+# where JavaScript can sit: an action object, the document's open action, or
+# the "additional actions" of a page, field or the document
+_JS_PATHS = ["JS", "OpenAction/JS"] + [f"AA/{k}/JS" for k in (
+    "O", "C", "WC", "WS", "DS", "WP", "DP", "K", "F", "V", "Fo", "Bl", "PO", "PC", "PV", "PI", "D", "E", "X", "U")]
 
 
 def to_bytes(doc, scrub=True):
@@ -685,6 +904,17 @@ def to_bytes(doc, scrub=True):
         # every link and every invisible (OCR) text layer in the document.
         # Anything of that kind overlapping a redacted region is already gone.
         clean.scrub(hidden_text=False, remove_links=False, reset_fields=False, reset_responses=False)
+        # scrub() leaves JavaScript run on opening the file and "additional
+        # actions" (found by the forensic scan, DESIGN.md section 8)
+        cat = clean.pdf_catalog()
+        if "/JavaScript" in _object_text(clean, cat, "OpenAction"):
+            clean.xref_set_key(cat, "OpenAction", "null")
+        for holder in [cat] + [page.xref for page in clean]:
+            if clean.xref_get_key(holder, "AA")[0] != "null":
+                clean.xref_set_key(holder, "AA", "null")
+        # a fresh file ID: the first half is a permanent identifier that otherwise
+        # stays the same as the original's, tying the redacted copy to it
+        clean.xref_set_key(-1, "ID", f"[<{secrets.token_hex(16)}><{secrets.token_hex(16)}>]")
         data = clean.tobytes(garbage=1, deflate=True)
     return data
 

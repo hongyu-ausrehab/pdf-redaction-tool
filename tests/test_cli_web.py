@@ -60,13 +60,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual((code, err), (0, ""))
         self.assertIn("Name: [removed]", self.text(self.dir / "o.pdf"))
 
-    def test_leak_in_bookmark_gives_exit_code_2(self):
+    def test_terms_are_also_removed_outside_the_page(self):
         doc = pymupdf.open(self.src)
-        doc.set_toc([[1, "John Smith", 1]])
+        doc.set_toc([[1, "About John Smith", 1]])
+        doc[0].add_text_annot((300, 250), "call John Smith")  # nowhere near the text
         doc.save(self.dir / "toc.pdf")
-        code, _, err = run_cli("redact", self.dir / "toc.pdf", self.dir / "o.pdf", "-t", "John Smith")
-        self.assertEqual(code, 2)
-        self.assertIn("bookmark", err)
+        code, out, err = run_cli("redact", self.dir / "toc.pdf", self.dir / "o.pdf", "-t", "John Smith")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("bookmark titles", out)
+        res = pymupdf.open(self.dir / "o.pdf")
+        self.assertEqual(res.get_toc()[0][1], "About [redacted]")
+        self.assertEqual(list(res[0].annots()), [])
+        # a replacement puts the new text in the bookmark
+        run_cli("redact", self.dir / "toc.pdf", self.dir / "r.pdf", "--replace", "John Smith", "Jane Citizen")
+        self.assertEqual(pymupdf.open(self.dir / "r.pdf").get_toc()[0][1], "About Jane Citizen")
 
     def test_color(self):
         dst = self.dir / "o.pdf"
@@ -150,6 +157,26 @@ class WebTests(unittest.TestCase):
         out = core.open_pdf(pdf)
         self.assertNotIn("John Smith", out[0].get_text())
         self.assertIn("Reviewed", out[0].get_text())
+
+    def test_preview(self):
+        _, _, body = self.request("/api/open", make_doc().tobytes())
+        doc_id = json.loads(body)["id"]
+        ops = [{"page": 0, "rect": [0, 40, 400, 64], "kind": "blackout"}]
+        status, _, body = self.request("/api/preview", {"id": doc_id, "ops": ops})
+        res = json.loads(body)
+        self.assertEqual((status, res["id"], res["leaks"]), (200, doc_id + "-preview", []))
+        # the preview's pages render from the redacted result
+        status, _, png = self.request(f"/api/page?id={res['id']}&n=0&scale=1")
+        self.assertEqual((status, pymupdf.Pixmap(png).pixel(100, 52)[:3]), (200, (0, 0, 0)))
+        # the original is untouched: still searchable, still renders unredacted
+        _, _, body = self.request("/api/find", {"id": doc_id, "terms": ["John Smith"]})
+        self.assertEqual(len(json.loads(body)["hits"]), 1)
+        _, _, png = self.request(f"/api/page?id={doc_id}&n=0&scale=1")
+        self.assertNotEqual(pymupdf.Pixmap(png).pixel(100, 52)[:3], (0, 0, 0))
+        # a new preview replaces the last one
+        _, _, body = self.request("/api/preview", {"id": doc_id, "ops": []})
+        _, _, png = self.request(f"/api/page?id={json.loads(body)['id']}&n=0&scale=1")
+        self.assertNotEqual(pymupdf.Pixmap(png).pixel(100, 52)[:3], (0, 0, 0))
 
     def test_errors_are_json(self):
         for path, body, code in [("/api/open", b"garbage", 400), ("/api/page?id=nope&n=0", None, 400),

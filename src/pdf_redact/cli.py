@@ -35,12 +35,13 @@ def redact(args):
         op.color = fill
     if args.ops:  # these carry their own colour, if any
         ops += [core.Op.from_dict(d) for d in json.loads(Path(args.ops).read_text())]
-    replace_olds = []
+    replace_olds, searches = [], [(pat, None)] if pat else []  # searches: (pattern, replacement)
     for old, new in args.replace:
         rpat = core.pattern([old], case=args.case_sensitive)
         if rpat is None:
             continue
         ops += core.hits_to_ops(core.find(doc, rpat, pages), "replace", new)
+        searches.append((rpat, new))
         if old.lower() not in new.lower():  # otherwise the new text would "leak" the old
             replace_olds.append(old)
 
@@ -54,7 +55,10 @@ def redact(args):
         print("nothing to do", file=sys.stderr)
         return 1
 
-    for note in core.apply(doc, ops):
+    notes = core.apply(doc, ops)
+    for spat, new in searches:  # the terms also go from comments, links, bookmarks, metadata...
+        notes += core.scrub_matches(doc, spat, new)
+    for note in notes:
         print(f"note: {note}")
     data = core.to_bytes(doc, scrub=args.scrub)
     Path(args.output).write_bytes(data)
@@ -94,13 +98,12 @@ def main(argv=None):
 
     s = sub.add_parser("serve", help="start the browser editor")
     s.add_argument("--port", type=int, default=8765)
-    s.add_argument("--no-browser", action="store_true")
 
     args = ap.parse_args(argv)
     try:
         if args.cmd == "serve":
             from . import web
-            return web.serve(args.port, open_browser=not args.no_browser)
+            return web.serve(args.port)
         if args.output is None:
             p = Path(args.input)
             args.output = str(p.with_name(p.stem + "-redacted.pdf"))

@@ -5,17 +5,81 @@
 <title>PDF Redact</title>
 <style>
   body { margin: 0; font: 14px system-ui, sans-serif; background: #e5e5e5; }
+  /* The layout depends only on the window width, never on what is open: on a
+     narrow window blocks wrap onto the next line (Replace text under
+     Blackout) rather than hiding off-screen. The right 68px are the dino's
+     lane, which no control enters. */
   header { position: sticky; top: 0; z-index: 10; background: #fff; border-bottom: 1px solid #ccc;
-           padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+           padding: 8px 68px 8px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .row { display: flex; gap: 6px 12px; align-items: stretch; flex-wrap: wrap; }
+  .row > fieldset { flex: none; max-width: 100%; box-sizing: border-box; }
+  #filename { display: inline-block; width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   header fieldset { border: 1px solid #ddd; border-radius: 4px; padding: 4px 8px; margin: 0;
-                    display: flex; gap: 6px; align-items: center; }
+                    display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   header legend { font-size: 11px; color: #666; padding: 0 2px; }
-  textarea { width: 180px; height: 34px; font: inherit; resize: vertical; }
-  input[type=text] { width: 110px; }
+  [hidden] { display: none !important; }  /* the display:flex above would otherwise show hidden blocks */
+  header fieldset.tool { border-width: 2px; }
+  header fieldset.tool.active { border-color: #06c; background: #f2f7fd; }  /* where a drag draws */
+  header fieldset.tool.active legend { color: #06c; font-weight: bold; }
+  .sep { width: 1px; align-self: stretch; background: #ddd; margin: 0 2px; }
+  .part, .opts { display: flex; gap: 4px; align-items: center; }
+  .opts { flex-direction: column; align-items: flex-start; gap: 0; font-size: 12px; }
+  textarea { width: 130px; height: 34px; font: inherit; resize: vertical; }
+  input[type=text] { width: 86px; }
   button { cursor: pointer; }
   #apply { font-weight: bold; }
-  #status { flex-basis: 100%; color: #444; font-size: 13px; white-space: pre-wrap; }
+  #status { color: #444; font-size: 13px; white-space: pre-wrap; }
   #status.err { color: #b00; }
+  body.previewing header { background: #fff8d6; }
+  body.previewing .page { cursor: default; outline: 3px solid #e0b000; }
+
+  /* --- the dino: decoration only, in the free space right of row 2 ------------ */
+  #dino { position: absolute; right: 12px; bottom: 26px; width: 48px; height: 48px; cursor: pointer; }
+  #dino svg { width: 48px; height: 48px; display: block; animation: bob 2.4s ease-in-out infinite;
+              transform-origin: 50% 100%; }
+  #dino .eye-white { animation: blink 4.5s infinite; transform-origin: 50% 25%; transform-box: fill-box; }
+  #dino .shades, #dino .sweat { display: none; }
+  #dino.shades .shades, #dino.worried .sweat { display: inline; }
+  #dino.hop svg { animation: hop 0.45s cubic-bezier(.3, 1.6, .5, 1); }
+  #dino { transition: transform 0.9s ease-in-out; }  /* the victory lap */
+  #dino.away { pointer-events: none; }
+  #dino.running svg { animation: run 0.22s linear infinite; }
+  /* idle life: pacing inside its lane (on a wrapper, so it never fights the
+     hop / roar / lap transforms), and sleeping */
+  #dino .pace { transition: transform 1.2s linear; }
+  #dino.walking svg { animation: run 0.35s linear infinite; }
+  #dino .lid { display: none; }
+  #dino.asleep .lid { display: inline; }
+  #dino.asleep .eye-white { display: none; }
+  #dino.asleep svg { animation: snooze 3s ease-in-out infinite; }
+  @keyframes snooze { 50% { transform: translateY(1px) scaleY(0.94); } }
+  /* the z z z stays up while it sleeps, so it floats above its head, inside the lane, clear of the status text */
+  #dino-say.sleepy { right: 10px; bottom: 76px; padding: 1px 6px; color: #888; font-style: italic;
+                     animation: drift 2.5s ease-in-out infinite; }
+  @keyframes drift { 50% { transform: translateY(-4px); } }
+  @keyframes run { 50% { transform: translateY(-3px) rotate(-4deg); } }
+  /* grows up and left; while big it lets clicks through to the toolbar under it */
+  #dino.roar svg { animation: roar 1.6s ease-in-out; transform-origin: 100% 100%; pointer-events: none; }
+  #dino-say { position: absolute; right: 56px; bottom: 30px; max-width: 220px; padding: 4px 9px;
+              background: #fff; border: 1px solid #f78f20; border-radius: 10px; font-size: 12px;
+              white-space: nowrap; pointer-events: none; opacity: 0; transition: opacity .2s; }
+  #dino-say.on { opacity: 1; }
+  #dino-say.big { right: 104px; bottom: 50px; font-size: 20px; font-weight: bold; border-width: 2px; }
+  .confetti { position: absolute; width: 6px; height: 9px; pointer-events: none;
+              animation: confetti 1.3s ease-out forwards; }
+  @keyframes bob { 50% { transform: translateY(-2px); } }
+  @keyframes blink { 0%, 94%, 100% { transform: scaleY(1); } 97% { transform: scaleY(0.1); } }
+  @keyframes hop { 40% { transform: translateY(-16px) rotate(-6deg); } 100% { transform: none; } }
+  @keyframes roar {
+    15% { transform: scale(2) rotate(-8deg); }  30%, 60% { transform: scale(2) rotate(8deg); }
+    45%, 75% { transform: scale(2) rotate(-8deg); }  90% { transform: scale(2) rotate(0); }
+  }
+  @keyframes confetti { to { transform: translate(var(--dx), var(--dy)) rotate(var(--r)); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) {
+    #dino svg, #dino .eye-white, #dino.hop svg, #dino.roar svg, #dino.running svg,
+    #dino.walking svg, #dino.asleep svg, #dino-say.sleepy { animation: none !important; }
+    #dino, #dino .pace { transition: none; }
+  }
   #pages { padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 16px; }
   .page { position: relative; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.3);
           cursor: crosshair; user-select: none; touch-action: none; }
@@ -40,37 +104,58 @@
 </head>
 <body>
 <header>
-  <label><input type="file" id="file" accept="application/pdf,.pdf"></label>
-  <fieldset><legend>Draw mode (B / R)</legend>
-    <label><input type="radio" name="mode" value="blackout" checked> Blackout</label>
-    <label><input type="radio" name="mode" value="replace"> Replace text</label>
+  <input type="file" id="file" accept="application/pdf,.pdf" hidden>  <!-- opened via the drop area / button -->
+  <!-- Two fixed rows: the layout never changes when a file is opened or the window resizes
+       (a row scrolls sideways instead of wrapping). -->
+  <div class="row">
+  <fieldset class="tool" data-mode="blackout"><legend>Blackout</legend>
+    <label title="dragging on a page draws a blackout box"><input type="radio" name="mode" value="blackout" checked> draw boxes (B)</label>
+    <span class="sep"></span>
+    <span class="part" title="colour of new blackouts; click a blackout on the page to give it this colour">
+      <button class="swatch on" style="background:#000000" data-c="#000000" title="black"></button>
+      <button class="swatch" style="background:#404040" data-c="#404040" title="dark grey"></button>
+      <button class="swatch" style="background:#9e9e9e" data-c="#9e9e9e" title="grey"></button>
+      <button class="swatch" style="background:#ffffff" data-c="#ffffff" title="white (erase)"></button>
+      <button class="swatch" style="background:#c62828" data-c="#c62828" title="red"></button>
+      <button class="swatch" style="background:#1f4e9c" data-c="#1f4e9c" title="blue"></button>
+      <input type="color" id="color" value="#000000" title="any colour">
+    </span>
+    <span class="sep"></span>
+    <textarea id="terms" placeholder="text to black out, one per line"></textarea>
+    <span class="opts">
+      <label title="treat each line as a regular expression"><input type="checkbox" id="regex"> regex</label>
+      <label><input type="checkbox" id="bcase"> match case</label>
+    </span>
+    <button id="find" title="mark every occurrence for blackout">Find</button>
   </fieldset>
-  <fieldset id="palette"><legend>Blackout colour (click a region to recolour it)</legend>
-    <button class="swatch on" style="background:#000000" data-c="#000000" title="black"></button>
-    <button class="swatch" style="background:#404040" data-c="#404040" title="dark grey"></button>
-    <button class="swatch" style="background:#9e9e9e" data-c="#9e9e9e" title="grey"></button>
-    <button class="swatch" style="background:#ffffff" data-c="#ffffff" title="white (erase)"></button>
-    <button class="swatch" style="background:#c62828" data-c="#c62828" title="red"></button>
-    <button class="swatch" style="background:#1f4e9c" data-c="#1f4e9c" title="blue"></button>
-    <input type="color" id="color" value="#000000" title="any colour">
-  </fieldset>
-  <fieldset><legend>Black out matches</legend>
-    <textarea id="terms" placeholder="one term per line"></textarea>
-    <label title="treat each line as a regular expression"><input type="checkbox" id="regex"> regex</label>
-    <button id="find">Find</button>
-  </fieldset>
-  <fieldset><legend>Find &amp; replace</legend>
+  <fieldset class="tool" data-mode="replace"><legend>Replace text</legend>
+    <label title="dragging on a page draws a box whose text is replaced"><input type="radio" name="mode" value="replace"> draw boxes (R)</label>
+    <span class="sep"></span>
     <input type="text" id="old" placeholder="find"> &rarr; <input type="text" id="new" placeholder="replace with">
-    <button id="replace">Find</button>
+    <span class="opts"><label><input type="checkbox" id="rcase"> match case</label></span>
+    <button id="replace" title="mark every occurrence for replacement">Find</button>
   </fieldset>
-  <label><input type="checkbox" id="case"> match case</label>
-  <label>Zoom <select id="zoom">
-    <option>0.75</option><option selected>1.25</option><option>1.5</option><option>2</option>
-  </select></label>
-  <label title="remove metadata, XMP, JavaScript, attachments and thumbnails"><input type="checkbox" id="scrub" checked> scrub metadata</label>
-  <button id="undo" title="Ctrl+Z: undo the last action (a whole Find counts as one)" disabled>Undo</button>
-  <button id="clear" title="back to the file as opened (can itself be undone)" disabled>Undo all</button>
-  <button id="apply">Apply &amp; download</button>
+  </div>
+  <div class="row">
+  <fieldset><legend>File</legend>
+    <span id="filename">no file open</span>
+    <button id="open" title="open a PDF (you can also drop one anywhere on the window)">Open PDF&hellip;</button>
+  </fieldset>
+  <fieldset><legend>View</legend>
+    <label>Zoom <select id="zoom">
+      <option>0.75</option><option selected>1.25</option><option>1.5</option><option>2</option>
+    </select></label>
+  </fieldset>
+  <fieldset><legend>Edit &amp; save</legend>
+    <button id="undo" title="Ctrl+Z: undo the last action (a whole Find counts as one)" disabled>Undo</button>
+    <button id="clear" title="back to the file as opened (can itself be undone)" disabled>Undo all</button>
+    <button id="preview" title="show the result here, without downloading">Preview</button>
+    <button id="apply">Apply &amp; download</button>
+    <span class="sep"></span>
+    <label title="also remove document info (author, title, dates...), XMP metadata, attachments, JavaScript and page thumbnails"><input type="checkbox" id="scrub" checked> scrub metadata</label>
+  </fieldset>
+  </div>
+  <div id="dino" title="Hi! Click me"></div><div id="dino-say"></div>
   <div id="status">Open a PDF, then drag on a page to mark a region. Hover a region to see through it and click × to remove it; click a blackout to give it the current colour; double-click a replace region to edit its text.</div>
 </header>
 <div id="pages"><div id="drop">Click to choose a PDF file, or drop one here</div></div>
@@ -81,8 +166,182 @@ let doc = null;    // {id, name, pages: [[w, h], ...]}
 let ops = [];      // {page, rect: [x0, y0, x1, y1] in PDF points, kind, text}
 let saved = "[]";  // ops as last downloaded, to warn only about unsaved work
 let history = [];  // snapshots of ops before each action, for Undo
+let previewId = null;  // id of the rendered result while previewing
+let previewVersion = 0;  // bumped per preview, so its page images are fetched afresh
 
-function status(msg, err = false) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+function status(msg, err = false) {
+  $("status").textContent = msg;
+  $("status").className = err ? "err" : "";
+  if (err) dino.worry();
+}
+
+// --- the dino (decoration only: nothing in the editor depends on it) ---------
+const dino = (() => {
+  const el = $("dino"), bubble = $("dino-say");
+  const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  // our own 16x16 pixel T-rex, facing right ("#" body, "o" eye)
+  const art = [
+    "......########..", ".....##########.", ".....##o#######.", ".....##########.",
+    ".....######.....", ".....#########..", "#....#####......", "#...########....",
+    "##.######..#....", "#########.......", ".########.......", "..######........",
+    "...##..##.......", "...#....#.......", "...##...##......"];
+  let px = "";
+  art.forEach((row, y) => [...row].forEach((c, x) => {
+    if (c === "#") px += `<rect x="${x}" y="${y}" width="1.02" height="1.02"/>`;
+  }));
+  el.innerHTML = `<div class="pace"><svg viewBox="0 0 16 16" shape-rendering="crispEdges" aria-hidden="true"><g class="body">
+    <g fill="#f78f20">${px}</g>
+    <rect class="eye-white" x="7" y="2" width="1" height="1" fill="#fff"/>
+    <g class="lid"><rect x="7" y="2" width="1" height="1" fill="#f78f20"/><rect x="7" y="2.6" width="1" height="0.4" fill="#333"/></g>
+    <g class="shades" fill="#222"><rect x="6" y="2" width="4" height="1"/><rect x="10" y="1.6" width="2" height="0.4"/></g>
+    <rect class="sweat" x="4" y="0.5" width="1" height="1.5" fill="#4aa3f0"/></g></svg></div>`;
+  const body = el.querySelector(".body"), pace = el.querySelector(".pace");
+  const face = (left) => left ? body.setAttribute("transform", "translate(16 0) scale(-1 1)") : body.removeAttribute("transform");
+  let lapping = false;
+  const quips = ["Rawr!", "Your secrets are safe with me.", "Black is my favourite colour.",
+                 "I saw nothing.", "Tiny arms, big redactions.", "Pixels in, secrets out.", "*happy dino noises*"];
+  let sayTimer, clicks = [];
+  function say(text, ms = 2200, big = false) {
+    bubble.textContent = text;
+    bubble.classList.toggle("big", big);
+    bubble.classList.add("on");
+    clearTimeout(sayTimer);
+    sayTimer = setTimeout(() => bubble.classList.remove("on"), ms);
+  }
+  function play(cls) {  // restart a one-off animation
+    el.classList.remove("hop", "roar");
+    void el.offsetWidth;
+    el.classList.add(cls);
+  }
+  function confetti() {  // bursts from wherever the dino is now
+    if (calm) return;
+    const host = el.offsetParent, h = host.getBoundingClientRect(), me = el.getBoundingClientRect();
+    for (let i = 0; i < 18; i++) {
+      const c = document.createElement("div");
+      c.className = "confetti";
+      c.style.background = ["#f78f20", "#1f4e9c", "#c62828", "#2e9e44", "#e0b000"][i % 5];
+      c.style.left = me.left - h.left + 20 + "px";
+      c.style.top = me.top - h.top + 10 + "px";
+      c.style.setProperty("--dx", `${Math.round(Math.random() * 160 - 120)}px`);
+      c.style.setProperty("--dy", `${Math.round(Math.random() * 50 - 10)}px`);
+      c.style.setProperty("--r", `${Math.round(Math.random() * 720)}deg`);
+      host.appendChild(c);
+      setTimeout(() => c.remove(), 1400);
+    }
+  }
+  // --- idle life: pacing in its lane, looking around, falling asleep ---------
+  // (?dino-sleep=MS shortens the 1-minute nap delay, for testing)
+  const SLEEP_AFTER = Number(new URLSearchParams(location.search).get("dino-sleep")) || 60000;
+  let asleep = false, wokeAt = 0, lastActive = Date.now(), pointerDown = false, x = 0, idleTimer;
+  const busy = () => lapping || asleep || pointerDown || document.hidden || el.classList.contains("roar");
+  function walk(to, then) {  // a few small steps inside the lane (it is only ~20px wider than the dino)
+    face(to < x);
+    x = to;
+    el.classList.add("walking");
+    pace.style.transform = `translateX(${to}px)`;
+    setTimeout(() => { el.classList.remove("walking"); then?.(); }, calm ? 0 : 1200);
+  }
+  function idle() {
+    clearTimeout(idleTimer);
+    let takes = 0;  // how long this move lasts, so the next one never overlaps it
+    if (!calm && !busy()) {
+      if (Math.random() < 0.6) {  // pace: left, turn, right, home (3 walks of 1.2 s + 2 pauses)
+        walk(-8, () => setTimeout(() => walk(6, () => setTimeout(() => walk(0, () => face(false)), 600)), 600));
+        takes = 4800;
+      } else {  // look around
+        [[0, true], [900, false], [1700, true], [2500, false]].forEach(([t, left]) => setTimeout(() => !asleep && face(left), t));
+        takes = 2500;
+      }
+    }
+    idleTimer = setTimeout(idle, takes + 3000 + Math.random() * 7000);  // then 3-10 s of rest
+  }
+  idleTimer = setTimeout(idle, 3000 + Math.random() * 3000);
+  function sleep() {
+    asleep = true;
+    pace.style.transform = "";
+    x = 0;
+    face(false);
+    el.classList.remove("walking");
+    el.classList.add("asleep");
+    bubble.classList.add("sleepy");
+    say("z z z", 1e9);
+  }
+  function activity() {  // anything you do counts; it also wakes the dino
+    lastActive = Date.now();
+    if (!asleep) return;
+    asleep = false;
+    wokeAt = Date.now();
+    el.classList.remove("asleep");
+    bubble.classList.remove("sleepy");
+    play("hop");
+    say("Huh?! I'm awake! 👀");
+  }
+  ["pointerdown", "pointermove", "keydown", "wheel"].forEach((t) => document.addEventListener(t, activity, true));
+  document.addEventListener("pointerdown", () => { pointerDown = true; }, true);
+  document.addEventListener("pointerup", () => { pointerDown = false; }, true);
+  setInterval(() => {
+    if (!asleep && !lapping && !document.hidden && Date.now() - lastActive > SLEEP_AFTER) sleep();
+  }, 1000);
+
+  el.addEventListener("click", () => {
+    const now = Date.now();
+    if (now - wokeAt < 500) return;  // this click woke it up: let it say so
+    clicks = clicks.filter((t) => now - t < 1500).concat(now);
+    if (clicks.length >= 3) {  // easter egg: 3 quick clicks
+      clicks = [];
+      play("roar");
+      say("RAAAWR!!! 🦖", 2600, true);
+    } else {
+      play("hop");
+      say(quips[Math.floor(Math.random() * quips.length)]);
+    }
+  });
+  return {
+    say,
+    idle,
+    hop: () => play("hop"),
+    // Victory lap: browsers show their download pop-up at the top right, over the
+    // dino's home, so it runs to the empty grey margin left of the first page,
+    // just under the toolbar, celebrates there and trots back.
+    celebrate() {
+      el.classList.remove("worried");
+      const party = () => {
+        say("Redacted! 🎉", 3000);
+        confetti();
+        [0, 500, 1000].forEach((t) => setTimeout(() => play("hop"), t));
+      };
+      if (lapping) return party();
+      lapping = true;
+      const h = el.offsetParent.getBoundingClientRect(), me = el.getBoundingClientRect();
+      const first = document.querySelector(".page");
+      const x = first ? Math.max(16, first.getBoundingClientRect().left - 64) : h.width * 0.3;
+      const travel = calm ? 0 : 900;
+      el.classList.add("away", "running");
+      face(true);
+      el.style.transform = `translate(${x - me.left}px, ${h.bottom + 10 - me.top}px)`;
+      setTimeout(() => {
+        el.classList.remove("running");
+        face(false);
+        const at = el.getBoundingClientRect();  // put the bubble beside it, out there
+        Object.assign(bubble.style, { right: "auto", bottom: "auto",
+          left: at.right - h.left + 6 + "px", top: at.top - h.top + 10 + "px" });
+        party();
+        setTimeout(() => {  // trot home
+          bubble.removeAttribute("style");
+          el.classList.add("running");
+          el.style.transform = "";
+          setTimeout(() => { el.classList.remove("running", "away"); lapping = false; }, travel);
+        }, 3300);
+      }, travel);
+    },
+    worry() {
+      el.classList.add("worried");
+      say("Uh-oh... check the message below.", 3000);
+      setTimeout(() => el.classList.remove("worried"), 3500);
+    },
+    shades(on) { el.classList.toggle("shades", on); if (on) say("Incognito mode 😎"); },
+  };
+})();
 function zoom() { return parseFloat($("zoom").value); }
 function mode() { return document.querySelector("input[name=mode]:checked").value; }
 function color() { return $("color").value; }
@@ -95,6 +354,8 @@ async function api(path, body) {
 
 async function openFile(file) {
   if (!file) return;
+  if (JSON.stringify(ops) !== saved &&
+      !confirm(`Open ${file.name}? The changes to ${doc.name} that you haven't downloaded will be lost.`)) return;
   status(`Opening ${file.name}...`);
   try {
     const info = await (await api("/api/open", file)).json();
@@ -102,14 +363,21 @@ async function openFile(file) {
     ops = [];
     saved = "[]";
     history = [];
+    previewId = null;
     render();
+    $("filename").textContent = $("filename").title = file.name;
     status(`${file.name}: ${doc.pages.length} page(s).`);
+    dino.shades(false);
+    dino.hop();
+    dino.say(doc.pages.length > 20 ? `${doc.pages.length} pages?! Let's go. 🦖` : "Ooh, a PDF! 📄");
   } catch (e) { status(e.message, true); }
 }
 
 function render() {
   const z = zoom(), dpr = window.devicePixelRatio || 1, root = $("pages");
   root.innerHTML = "";
+  document.body.classList.toggle("previewing", !!previewId);
+  $("preview").textContent = previewId ? "Back to editing" : "Preview";
   doc.pages.forEach(([w, h], n) => {
     const page = document.createElement("div");
     page.className = "page";
@@ -119,11 +387,14 @@ function render() {
     page.innerHTML = `<span class="pno">${n + 1}</span>`;
     const img = document.createElement("img");
     img.loading = "lazy";
-    img.src = `/api/page?id=${doc.id}&n=${n}&scale=${z * dpr}`;
+    // each preview gets new image addresses: browsers reuse an image already shown for the
+    // same address (even with no-store), which kept showing the first preview
+    img.src = `/api/page?id=${previewId || doc.id}&n=${n}&scale=${z * dpr}` + (previewId ? `&v=${previewVersion}` : "");
     // replace previews take their background colour from the rendered page
     img.addEventListener("load", () => ops.some((o) => o.kind === "replace" && o.page === n) && drawBoxes());
     page.appendChild(img);
-    page.addEventListener("pointerdown", startDraw);
+    if (!previewId) page.addEventListener("pointerdown", startDraw);
+    else page.addEventListener("pointerdown", () => { leavePreview(); status("Back to editing - draw your region now."); });
     root.appendChild(page);
   });
   drawBoxes();
@@ -160,6 +431,7 @@ function background(op) {
 
 function drawBoxes() {
   document.querySelectorAll(".box").forEach((b) => b.remove());
+  if (previewId) return;  // the preview shows the result itself, no overlays
   const z = zoom(), pages = document.querySelectorAll(".page");
   ops.forEach((op) => {
     const b = document.createElement("div");
@@ -232,12 +504,15 @@ function startDraw(e) {
   page.addEventListener("pointercancel", up);
 }
 
-async function findHits(lines, regex) {
-  const body = { id: doc.id, case: $("case").checked, terms: regex ? [] : lines, regexes: regex ? lines : [] };
+async function findHits(lines, regex, matchCase) {
+  const body = { id: doc.id, case: matchCase, terms: regex ? [] : lines, regexes: regex ? lines : [] };
   return (await (await api("/api/find", body)).json()).hits;
 }
 
-function addHits(hits, kind, text = "") {
+// query: the search that found these, so the server can also remove the term from
+// comments, links, bookmarks and metadata (it travels with the regions, so Undo drops it too)
+function addHits(hits, kind, text = "", query = null) {
+  leavePreview();
   const seen = new Set(ops.map((o) => o.page + ":" + o.rect.join(",")));
   const before = JSON.stringify(ops);  // the whole batch is one undo step
   let added = 0;
@@ -245,7 +520,7 @@ function addHits(hits, kind, text = "") {
     const key = h.page + ":" + rect.join(",");
     if (seen.has(key)) return;
     seen.add(key);
-    ops.push({ page: h.page, rect, kind, text: i === 0 ? text : "", color: color() });
+    ops.push({ page: h.page, rect, kind, text: i === 0 ? text : "", color: color(), query });
     added++;
   }));
   if (added) history.push(before);
@@ -258,8 +533,9 @@ $("find").addEventListener("click", async () => {
   const lines = $("terms").value.split("\n").map((s) => s.trim()).filter(Boolean);
   if (!lines.length) return status("Enter at least one term.", true);
   try {
-    const hits = await findHits(lines, $("regex").checked);
-    const added = addHits(hits, "blackout");
+    const hits = await findHits(lines, $("regex").checked, $("bcase").checked);
+    const added = addHits(hits, "blackout", "", { terms: $("regex").checked ? [] : lines,
+      regexes: $("regex").checked ? lines : [], case: $("bcase").checked, replace: null });
     status(`${hits.length} match(es), ${added} new region(s); ${ops.length} total.`);
   } catch (e) { status(e.message, true); }
 });
@@ -269,9 +545,28 @@ $("replace").addEventListener("click", async () => {
   const old = $("old").value.trim();
   if (!old) return status("Enter the text to find.", true);
   try {
-    const hits = await findHits([old], false);
-    const added = addHits(hits, "replace", $("new").value);
+    const hits = await findHits([old], false, $("rcase").checked);
+    const added = addHits(hits, "replace", $("new").value,
+      { terms: [old], regexes: [], case: $("rcase").checked, replace: $("new").value });
     status(`${hits.length} match(es), ${added} new region(s); ${ops.length} total.`);
+  } catch (e) { status(e.message, true); }
+});
+
+$("preview").addEventListener("click", async () => {
+  if (!doc) return status("Open a PDF first.", true);
+  if (previewId) { leavePreview(); return; }
+  status("Building preview...");
+  try {
+    const res = await (await api("/api/preview", { id: doc.id, ops, scrub: $("scrub").checked })).json();
+    previewId = res.id;
+    previewVersion++;
+    render();
+    dino.shades(true);
+    const extra = res.notes.length ? "\n" + res.notes.join("\n") : "";
+    const head = `Preview of the result with ${ops.length} region(s) - nothing saved yet. ` +
+                 "Apply & download to save it, or Back to editing (any edit also returns).";
+    if (res.leaks.length) status(head + "\nCheck these:\n" + res.leaks.join("\n") + extra, true);
+    else status(head + extra);
   } catch (e) { status(e.message, true); }
 });
 
@@ -290,21 +585,36 @@ $("apply").addEventListener("click", async () => {
     saved = JSON.stringify(ops);
     const extra = notes.length ? "\n" + notes.join("\n") : "";
     if (leaks.length) status("Saved, but check these:\n" + leaks.join("\n") + extra, true);
-    else status(`Saved ${a.download} with ${ops.length} region(s) applied. The original file is unchanged.` + extra);
+    else {
+      status(`Saved ${a.download} with ${ops.length} region(s) applied. The original file is unchanged.` + extra);
+      dino.celebrate();
+    }
   } catch (e) { status(e.message, true); }
 });
 
-$("file").addEventListener("change", (e) => openFile(e.target.files[0]));
+$("file").addEventListener("change", (e) => {
+  openFile(e.target.files[0]);
+  e.target.value = "";  // so picking the same file again still counts as a change
+});
+$("open").addEventListener("click", () => $("file").click());
 document.addEventListener("click", (e) => { if (e.target.id === "drop") $("file").click(); });
 $("zoom").addEventListener("change", () => doc && render());
+// highlight the block whose "draw boxes" mode is on: that's what a drag on the page does
+function markMode() {
+  document.querySelectorAll("fieldset.tool").forEach((f) => f.classList.toggle("active", f.dataset.mode === mode()));
+}
+document.querySelectorAll("input[name=mode]").forEach((r) => r.addEventListener("change", markMode));
+markMode();
 function markSwatch() {
   document.querySelectorAll(".swatch").forEach((s) => s.classList.toggle("on", s.dataset.c === color()));
 }
 document.querySelectorAll(".swatch").forEach((s) =>
   s.addEventListener("click", () => { $("color").value = s.dataset.c; markSwatch(); }));
 $("color").addEventListener("input", markSwatch);
-function remember() { history.push(JSON.stringify(ops)); }
+function leavePreview() { if (previewId) { previewId = null; render(); dino.shades(false); } }  // any edit returns to editing
+function remember() { leavePreview(); history.push(JSON.stringify(ops)); }
 function undo() {
+  leavePreview();
   if (history.length) { ops = JSON.parse(history.pop()); drawBoxes(); }
 }
 function undoAll() {  // back to the file as opened; Undo brings everything back
@@ -319,6 +629,7 @@ document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "z") { e.preventDefault(); undo(); }
   else if (e.key === "b" || e.key === "r") {
     document.querySelector(`input[name=mode][value=${e.key === "b" ? "blackout" : "replace"}]`).checked = true;
+    markMode();
   }
 });
 window.addEventListener("beforeunload", (e) => { if (JSON.stringify(ops) !== saved) e.preventDefault(); });

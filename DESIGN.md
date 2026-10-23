@@ -50,8 +50,8 @@ from the page around it, so it looks like the result rather than a box.
 
 ## Limitations
 
-- Bookmarks (outline titles) are not changed; the CLI warns if a search term
-  appears in one.
+- Bookmarks, comments, links and metadata are cleaned for *searched* terms
+  only; a hand-drawn box can't know what text a bookmark elsewhere repeats.
 - A replacement can only use the original font if that font object belongs
   to the page itself (not only to an embedded form/XObject), and for CID
   fonts if it uses the common Identity-H encoding; otherwise a standard font
@@ -224,10 +224,89 @@ the "choose or drop" area couldn't be clicked.
   renaming an embedded font). No note is given when the original is itself
   a standard 14 font, since the substitute is then the same font.
 
+### 8. Fourth round (2026-10-23): is the underlying data really gone?
+
+Question: after a blackout or replacement, is the data under it wiped from
+the file, or only from the visible page? Earlier tests checked the visible
+layers (extracted text, content streams, image pixels under a box).
+
+**Method.** A trap PDF (`tests/test_forensic.py`) plants one token in 17
+places: (1) visible text, (2) invisible OCR text, (3) image pixels with an
+OCR layer 5pt off, (4) marked-content `/ActualText`, (5) a hidden
+optional-content layer, (6) a form XObject, (7) `/PieceInfo`, (8) comments
+on and away from the text, (9) a form field, (10) a link URI, (11) metadata,
+(12) a bookmark, (13) an attachment, (14) JavaScript run on opening,
+(15) an older revision kept by an incremental save, (16) structure-tree
+`/Alt` (and later (17), a page thumbnail). `scripts/forensic_check.py` then searches every object and every
+decompressed stream (plain, hex and UTF-16 forms), the raw bytes, text with
+hidden layers off and on, bookmarks, metadata, attachments, fields,
+annotations and links. On the input it finds the token in 33 places.
+
+**Result before fixes: 13 places survived** a normal *Black out matches* +
+apply + scrub. Gone already: (1) (2) (6) (9 - it overlapped a match) (11)
+(13) (15). Survived, and how each was fixed:
+
+- (5) hidden layer: PyMuPDF's extraction skips hidden layers, so search and
+  the glyph selection never saw the text. MuPDF's redaction itself does
+  remove hidden-layer glyphs in a rect (tested with the layer on and off).
+  `set_layer()` was tried first to switch layers on and silently changed
+  nothing; `set_layer_ui_config()` works. All layers are now on while
+  finding and redacting, and restored afterwards (the output keeps the layer
+  hidden). A replacement whose old text was only on a hidden layer is
+  removed but not rewritten - writing it would make it visible.
+- (4) `/ActualText`: MuPDF removed the glyphs but kept the marked-content
+  tag, and extraction still reported its text. (16) `/Alt` in the structure
+  tree and (7) `/PieceInfo` are untouched by redaction. On redacted pages
+  these are now stripped (content streams, property lists, structure
+  elements on that page). In the real 14-page guide 45 such entries were
+  removed from its redacted pages in the stress run - the cost is lost alt
+  text for screen readers on those pages. (An earlier note here called the
+  guide a tagged PDF; checked later, it has no structure tree - the entries
+  are marked-content alt text in its page content.)
+- Follow-up: listing the guide's document-level data before and after a
+  scrubbed save (InDesign creator, producer, dates, 2,483 chars of XMP, 14
+  page thumbnails - all removed) showed one tie to the original left: the
+  first half of the trailer `/ID`, a permanent identifier, was unchanged.
+  Scrubbing now writes a fresh random ID.
+- (14) JavaScript: `scrub(javascript=True)` left the catalog's
+  `/OpenAction` script; JavaScript open actions and `/AA` are now removed.
+- (8) comments away from the text, (10) the link, (12) the bookmark: a page
+  region can't reach them. For *searched* terms, `scrub_matches()` now
+  deletes comments, fields, links and attachments mentioning them and
+  replaces them in bookmark titles and metadata. In the editor, each found
+  region carries its search, so Undo drops this too.
+- (3) the image: 62 of 834 dark pixels of the token survived, because the
+  OCR box was offset from the word in the picture and the blackout followed
+  the OCR box. Blackouts overlapping an image are now padded by 20% of the
+  line height for pixel blanking.
+
+  Follow-up the same day, measuring an image-only scan: that padding was
+  applied to *every* blackout over an image and scaled with the box, so a
+  box drawn by hand on a scan came out ~6pt larger per side (and a big box
+  far more). It now applies only when the region holds OCR text, capped at
+  4pt; a box with no text under it is painted exactly as drawn. The same
+  measurement showed the scan's JPEG is stored again losslessly (PNG/Flate):
+  outside the box the image data is bit-for-bit identical, but that page's
+  image grew from 210 KB to 576 KB.
+
+  A second follow-up: asked whether wiping depends on *scrub metadata*, the
+  trap was re-run with scrub **off**. Two things survived: the JavaScript
+  open action (holding the token) and a page **thumbnail** - added to the
+  trap as place (17), a picture of the unredacted page that a text scan
+  can't see. Neither should hang on a metadata option: thumbnails of
+  redacted pages are now always removed, and JavaScript mentioning a
+  searched term is always emptied. With scrub off the trap now also scans
+  clean (`test_scrub_off_still_wipes_the_term`).
+
+**Result after fixes: 0 places, 0 dark pixels**, for blackout and replace,
+through the library, the CLI and the web API (all in the test suite). The
+real-PDF stress and replacement runs were repeated without change.
+
 ## Testing
 
 ```sh
-uv run python -m unittest discover -s tests            # 54 tests
+uv run python -m unittest discover -s tests            # 59 tests
+uv run python -I scripts/forensic_check.py OUT.pdf TERM...  # is a term anywhere in the file?
 uv run python -I scripts/stress_real_pdfs.py FILE.pdf...  # random redactions on real PDFs
 uv run python -I scripts/check_replace.py FILE.pdf...     # replacements: font, extraction, overlap
 uv run python -I scripts/check_scanned.py SCAN.pdf 1      # image pixels destroyed, not covered
@@ -264,7 +343,7 @@ labels.) The second round's "895 of 895" was an overcount, see section 7.
 inside the box became one uniform value, while outside it 125 of 226,767
 samples differed, all on the box boundary. The browser editor was tested
 end to end with Playwright and headless Chromium (opening a file, drawing,
-replace prompts, colour palette and recolouring, Undo per action (a Find batch, a recolour), Undo all and undoing it, replace previews on a coloured background, opening a file by clicking the drop zone, search on normal and rotated pages, find & replace, ×,
+replace prompts, colour palette and recolouring, Undo per action (a Find batch, a recolour), Undo all and undoing it, Preview (result pages, no overlays, drawing disabled, Back and edit-to-leave), replace previews on a coloured background, opening a file by clicking the drop zone, search on normal and rotated pages, find & replace, ×,
 undo, zoom, download, a bad upload, console errors), and the downloaded PDF
 was checked for what was removed, replaced and kept.
 

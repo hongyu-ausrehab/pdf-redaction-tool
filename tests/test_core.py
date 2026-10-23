@@ -183,6 +183,18 @@ class BlackoutTests(unittest.TestCase):
         self.assertEqual(pix.pixel(225, 200)[:3], (0, 0, 0))  # covered half: blacked
         self.assertEqual(pix.pixel(275, 200)[:3], (255, 0, 0))  # other half: intact
 
+    def test_box_drawn_on_a_scan_is_exact_and_lossless(self):
+        grey = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 300, 200), False)
+        grey.set_rect(grey.irect, (180, 180, 180))
+        doc = pymupdf.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_image(page.rect, pixmap=grey)  # an image-only page, 1px per point
+        core.apply(doc, [core.Op(0, (100, 80, 200, 120))])  # no text under it: no padding
+        img = pymupdf.Pixmap(roundtrip(doc), roundtrip(doc)[0].get_images(full=True)[0][0])
+        self.assertEqual(img.pixel(150, 100)[:3], (255, 255, 255))  # inside: blanked in the image data
+        for x, y in ((97, 100), (203, 100), (150, 77), (150, 123)):  # 3px outside: untouched
+            self.assertEqual(img.pixel(x, y)[:3], (180, 180, 180))
+
     def test_hidden_ocr_text_on_scanned_page(self):
         doc = pymupdf.open()
         page = doc.new_page(width=400, height=300)
@@ -214,6 +226,14 @@ class BlackoutTests(unittest.TestCase):
         out, _, _ = redact_terms(doc, "John Smith", scrub=False)
         self.assertEqual([a.info["content"] for a in out[0].annots()], ["unrelated"])
         self.assertEqual(out[0].get_links(), [])
+
+    def test_scrub_gives_a_new_file_id(self):
+        src = core.open_pdf(make_doc().tobytes())
+        original = src.xref_get_key(-1, "ID")[1]
+        scrubbed, kept = core.open_pdf(core.to_bytes(src, scrub=True)), core.open_pdf(core.to_bytes(src, scrub=False))
+        first_half = lambda d: d.xref_get_key(-1, "ID")[1][:34]  # noqa: E731  "[<32 hex digits>"
+        self.assertNotEqual(first_half(scrubbed), original[:34])
+        self.assertEqual(first_half(kept), original[:34])  # without scrub the identifier is kept
 
     def test_scrub_removes_metadata(self):
         doc = make_doc()

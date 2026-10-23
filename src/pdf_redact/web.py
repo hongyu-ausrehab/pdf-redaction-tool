@@ -7,7 +7,6 @@ written to disk. The server binds to 127.0.0.1 only.
 import json
 import secrets
 import threading
-import webbrowser
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,19 +61,41 @@ def find(q, body):
     return 200, {"hits": [{"page": h.page, "text": h.text, "rects": h.rects} for h in hits]}
 
 
-def apply(q, body):
-    req = json.loads(body)
+def _redacted(req):
+    """(PDF bytes, notes, leaks) for a request's ops - shared by apply and preview."""
     doc = core.open_pdf(_get(req["id"])[0])  # a fresh copy: the cached one stays the original
     ops = [core.Op.from_dict(d) for d in req.get("ops", [])]
     notes = core.apply(doc, ops)
+    # regions found by a search carry it: remove those terms from comments,
+    # links, bookmarks and metadata too
+    queries = {json.dumps(d["query"], sort_keys=True): d["query"] for d in req.get("ops", []) if d.get("query")}
+    for q in queries.values():
+        pat = core.pattern(q.get("terms", []), q.get("regexes", []), bool(q.get("case")))
+        if pat:
+            notes += core.scrub_matches(doc, pat, q.get("replace"))
     data = core.to_bytes(doc, scrub=bool(req.get("scrub", True)))
-    leaks = core.verify(core.open_pdf(data), ops)
+    return data, notes, core.verify(core.open_pdf(data), ops)
+
+
+def apply(q, body):
+    data, notes, leaks = _redacted(json.loads(body))
     return 200, data, "application/pdf", [("X-Redact-Leaks", json.dumps(leaks, ensure_ascii=True)),
                                           ("X-Redact-Notes", json.dumps(notes, ensure_ascii=True))]
 
 
+def preview(q, body):
+    """Like apply, but keep the result for /api/page instead of downloading it.
+    One preview per document: each new one replaces the last."""
+    req = json.loads(body)
+    data, notes, leaks = _redacted(req)
+    preview_id = req["id"] + "-preview"
+    _docs[preview_id] = (data, core.open_pdf(data))
+    return 200, {"id": preview_id, "notes": notes, "leaks": leaks}
+
+
 ROUTES = {("GET", "/"): index, ("GET", "/api/page"): page,
-          ("POST", "/api/open"): open_doc, ("POST", "/api/find"): find, ("POST", "/api/apply"): apply}
+          ("POST", "/api/open"): open_doc, ("POST", "/api/find"): find, ("POST", "/api/apply"): apply,
+          ("POST", "/api/preview"): preview}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -118,12 +139,10 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("POST")
 
 
-def serve(port=8765, open_browser=True):
+def serve(port=8765):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{server.server_port}/"
-    print(f"PDF redact editor on {url}  (Ctrl+C to stop)")
-    if open_browser:
-        threading.Timer(0.5, webbrowser.open, [url]).start()
+    print(f"PDF redact editor: open http://127.0.0.1:{server.server_port}/ in your browser  (Ctrl+C to stop)",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
